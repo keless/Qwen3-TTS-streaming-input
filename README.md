@@ -10,8 +10,12 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 - `torch.compile` + CUDA graphs optimization
 - Crossfade overlap for seamless chunk transitions
 
-Added in this fork:
+From [kunzite-app/Qwen3-TTS-streaming](https://github.com/kunzite-app/Qwen3-TTS-streaming)
 - **Two-phase streaming** - faster first-chunk latency
+
+Added in this fork:
+- stream tokens in to a queue which then hands them sequentially to the Talker; meaning we start producing audio as soon as we get the first token.
+- This allows us to keep the same context as more text streams in; you can have already produced audio for sentence 1 as you are streaming sentence 2 in using the same text hiddens.
 
 ## Two-Phase Streaming
 
