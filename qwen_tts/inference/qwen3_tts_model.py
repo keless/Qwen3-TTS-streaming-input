@@ -27,6 +27,7 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from .live_text_source import LiveTextSource
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -1124,6 +1125,74 @@ class Qwen3TTSModel:
             first_chunk_emit_every=first_chunk_emit_every,
             first_chunk_decode_window=first_chunk_decode_window,
             first_chunk_frames=first_chunk_frames,
+            **gen_kwargs,
+        ):
+            yield chunk, sr
+
+    @torch.inference_mode()
+    def stream_generate_custom_voice_live_text(
+        self,
+        text_source: LiveTextSource,
+        speaker: str,
+        language: str = None,
+        instruct: Optional[str] = None,
+        priming_timeout_s: float = 10.0,
+        on_frame: Optional[Any] = None,
+        **kwargs,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """
+        Stream CustomVoice speech generation while consuming text incrementally
+        from `text_source` instead of a fully-known string. See
+        docs/superpowers/specs/2026-08-31-streaming-text-input-design.md.
+
+        Args:
+            text_source: A LiveTextSource that a producer (e.g. a simulator
+                thread, or eventually a real LLM adapter) pushes text into.
+            speaker: Speaker name. Validated against model.get_supported_speakers().
+            language: Language for synthesis.
+            instruct: Optional instruction describing desired style/emotion.
+            priming_timeout_s: Max time to wait for the first text to arrive.
+            on_frame: Optional callback(step_idx, used_pad) for telemetry.
+            **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
+
+        Yields:
+            Tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
+        """
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support stream_generate_custom_voice_live_text"
+            )
+
+        language = language if language is not None else "Auto"
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+
+        self._validate_languages([language])
+        self._validate_speakers([speaker])
+
+        instruct_ids = None
+        if instruct:
+            instruct_ids = self._tokenize_texts([self._build_instruct_text(instruct)])[0]
+
+        def tokenize_fn(text: str) -> torch.Tensor:
+            return self.processor(text=text, return_tensors="pt")["input_ids"].to(self.device)
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        for chunk, sr in self.model.stream_generate_pcm_live_text(
+            text_source=text_source,
+            tokenize_fn=tokenize_fn,
+            speaker=speaker,
+            language=language,
+            instruct_ids=instruct_ids,
+            priming_timeout_s=priming_timeout_s,
+            on_frame=on_frame,
             **gen_kwargs,
         ):
             yield chunk, sr
