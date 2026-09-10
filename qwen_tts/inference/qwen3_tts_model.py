@@ -17,7 +17,7 @@ import base64
 import io
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import librosa
@@ -1137,7 +1137,19 @@ class Qwen3TTSModel:
         language: str = None,
         instruct: Optional[str] = None,
         priming_timeout_s: float = 10.0,
-        on_frame: Optional[Any] = None,
+        on_frame: Optional[Callable[[int, bool], None]] = None,
+        # Streaming control -- forwarded explicitly to stream_generate_pcm_live_text.
+        # Previously these were silently dropped by the **kwargs filter below
+        # (only sampling params were in supported_params), so passing e.g.
+        # max_frames=10 here had zero effect and no error -- fixed by exposing
+        # them as real named parameters, matching stream_generate_custom_voice's
+        # pattern for the same knobs.
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 0,
+        max_frames: int = 10000,
+        use_optimized_decode: bool = False,
+        wind_down_frames: int = 200,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1153,7 +1165,23 @@ class Qwen3TTSModel:
             instruct: Optional instruction describing desired style/emotion.
             priming_timeout_s: Max time to wait for the first text to arrive.
             on_frame: Optional callback(step_idx, used_pad) for telemetry.
-            **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
+            emit_every_frames: Emit a PCM chunk every N codec frames.
+            decode_window_frames: Window size for decoding (longer = better
+                quality, more latency).
+            overlap_samples: Overlap samples for crossfade between chunks.
+            max_frames: Maximum number of codec frames to generate. If this
+                is reached while text_source still has not reported finished,
+                stream_generate_pcm_live_text raises RuntimeError after
+                yielding whatever was already generated -- see its docstring.
+            use_optimized_decode: Use CUDA graph optimized decode when
+                available (requires enable_streaming_optimizations()).
+            wind_down_frames: Once text_source reports finished, force a stop
+                after this many pad-conditioned frames if the talker hasn't
+                chosen to emit its own EOS by then -- see
+                stream_generate_pcm_live_text's docstring for why this is
+                bounded rather than unconditional.
+            **kwargs: Sampling parameters only -- do_sample, top_k, top_p, temperature,
+                subtalker_dosample, subtalker_top_k, subtalker_top_p, subtalker_temperature.
 
         Yields:
             Tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -1193,6 +1221,12 @@ class Qwen3TTSModel:
             instruct_ids=instruct_ids,
             priming_timeout_s=priming_timeout_s,
             on_frame=on_frame,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            wind_down_frames=wind_down_frames,
             **gen_kwargs,
         ):
             yield chunk, sr

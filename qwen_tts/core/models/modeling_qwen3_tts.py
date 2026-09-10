@@ -135,6 +135,33 @@ def _add_ref_code_context(
     return window_codes, 0
 
 
+def _realign_trailing_text_hidden(
+    trailing_text_hidden: torch.Tensor,
+    generation_step: int,
+    new_rows: Optional[torch.Tensor],
+    tts_pad_embed: torch.Tensor,
+) -> torch.Tensor:
+    """Backfill `trailing_text_hidden` up to `generation_step` before appending
+    `new_rows`, if any. The talker reads this tensor by absolute position
+    (`trailing_text_hidden[:, generation_step]`), not as a FIFO queue -- if a
+    prior step already fell back to `tts_pad_embed` (tensor shorter than the
+    step it needed), naively appending new rows "to the tail" would land them
+    at an index generation_step can never revisit, permanently discarding
+    them. Backfilling explicit pad rows up to generation_step first keeps the
+    tensor's length tracking "how many steps have been consumed" so new rows
+    always land at the correct upcoming index instead.
+    """
+    current_len = trailing_text_hidden.shape[1]
+    if current_len < generation_step:
+        gap = generation_step - current_len
+        trailing_text_hidden = torch.cat(
+            [trailing_text_hidden, tts_pad_embed.expand(-1, gap, -1)], dim=1
+        )
+    if new_rows is not None and new_rows.shape[1] > 0:
+        trailing_text_hidden = torch.cat([trailing_text_hidden, new_rows], dim=1)
+    return trailing_text_hidden
+
+
 def download_weights_from_hf_specific(
     model_name_or_path: str,
     cache_dir: str | None,
@@ -2644,6 +2671,39 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         ids = ids.to(self.talker.device)
         return self.talker.text_projection(self.talker.get_text_embeddings()(ids))
 
+    def _embed_committed_words(
+        self,
+        words: list[str],
+        tokenize_fn: Callable[[str], torch.Tensor],
+        is_utterance_start: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Embed each already-committed word independently and concatenate,
+        never joining multiple words into one string before tokenizing.
+
+        BPE tokenizers encode the word-boundary space as a *prefix* of the
+        following word (e.g. "synthesis" mid-sentence tokenizes as
+        `' synthesis'`, one token), not a suffix of the previous one. Every
+        word gets a leading space except the very first word of the whole
+        utterance (`is_utterance_start`), which matches how a real sentence
+        tokenizes with no leading space on its first token. Getting this
+        backwards (trailing space instead of leading) produces different,
+        more fragmented sub-word splits plus spurious standalone-space
+        tokens that the talker never saw in training -- verified against
+        whole-sentence tokenization, this leading-space scheme reproduces
+        the exact same token ids/count. Because BPE doesn't merge across a
+        word-boundary space in this vocab, tokenizing words independently
+        this way is equivalent to joining them first, so how many words
+        land in `words` together (a scheduling accident of how many
+        committed between two poll() calls) never changes the result.
+        """
+        if not words:
+            return None
+        parts = []
+        for i, w in enumerate(words):
+            text = w if (is_utterance_start and i == 0) else " " + w
+            parts.append(self._embed_text_chunk(text, tokenize_fn))
+        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
     @torch.inference_mode()
     def stream_generate_pcm(
         self,
@@ -2972,6 +3032,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         # Live-text control
         priming_timeout_s: float = 10.0,
         on_frame: Optional[Callable[[int, bool], None]] = None,
+        wind_down_frames: int = 200,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation while consuming text incrementally from
@@ -2990,6 +3051,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 before raising TimeoutError.
             on_frame: Optional callback(step_idx, used_pad) invoked once per
                 decode step, for telemetry (pad-fallback vs. real-text frames).
+            wind_down_frames: Once text_source reports finished, the talker
+                is still allowed to keep going on padding until it chooses to
+                emit its own EOS (the legitimate, trained-for behavior at the
+                genuine end of an utterance) -- but that can occasionally take
+                a highly variable, sometimes very large number of frames.
+                Force a stop after this many pad-conditioned frames past the
+                point finished became true, instead of waiting indefinitely.
+                If text_source's finish was only an idle-timeout guess and
+                gets revoked by a later push() before this triggers, the
+                counter resets to 0 and a fresh window starts if/when it
+                finishes again.
 
         Yields:
             Tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -3007,6 +3079,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             return self.talker.text_projection(self.talker.get_text_embeddings()(ids))
 
         # --- Priming: block until at least one talker token has committed ---
+        # (If the source finishes with zero text, primed_chunks stays empty and
+        # we raise below; the main loop's own `finished` handling -- not this
+        # priming loop -- is what appends tts_eos_embed once text_source reports
+        # finished, whether that happens during or after priming.)
         start = time.monotonic()
         primed_chunks: list = []
         while True:
@@ -3014,16 +3090,27 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             primed_chunks.extend(chunks)
             if primed_chunks or finished:
                 break
-            if time.monotonic() - start > priming_timeout_s:
+            remaining = priming_timeout_s - (time.monotonic() - start)
+            if remaining <= 0:
                 raise TimeoutError("No text arrived within priming_timeout_s; nothing to generate.")
-            time.sleep(0.01)
+            text_source.wait_for_more(timeout=remaining)
 
         if not primed_chunks:
             raise TimeoutError("Text source finished with no text; nothing to generate.")
 
-        first_chunk_embed = self._embed_text_chunk(" ".join(primed_chunks) + " ", tokenize_fn)
+        first_chunk_embed = self._embed_committed_words(primed_chunks, tokenize_fn, is_utterance_start=True)
+        assert first_chunk_embed.shape[1] >= 1, (
+            f"Primed text {primed_chunks!r} tokenized to zero talker tokens -- can't fill the "
+            "one real content-token slot the initial prefill needs."
+        )
 
         # --- Fixed conditioning (speaker/language/instruct), mirrors _build_talker_inputs ---
+        # NOTE: this duplicates (rather than shares) _build_talker_inputs's
+        # speaker/language/dialect/codec-prefill construction below, by design
+        # (this method is added alongside stream_generate_pcm without modifying
+        # any shared code it depends on). Keep in sync manually if that logic
+        # changes -- e.g. a new speaker, a new dialect exception, a language
+        # bugfix -- since it will NOT propagate here automatically.
         if speaker == "" or speaker is None:
             speaker_embed = None
         else:
@@ -3086,37 +3173,44 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 [codec_input_embedding_0, speaker_embed.view(1, 1, -1), codec_input_embedding_1], dim=1
             )
 
-        # --- Role tokens: tokenize the fixed prefix directly ---
-        role_ids = tokenize_fn("assistant\n")
+        # --- Role tokens: tokenize the fixed prefix directly (see Task 2 Step 1 verification) ---
+        role_ids = tokenize_fn("<|im_start|>assistant\n")
         if role_ids.dim() == 1:
             role_ids = role_ids.unsqueeze(0)
+        assert role_ids.shape[-1] == 3, (
+            f"Expected '<|im_start|>assistant\\n' to tokenize to 3 tokens (verified for "
+            f"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice), got {role_ids.shape[-1]} -- the role/prefill "
+            f"embedding construction below assumes exactly 3 and needs adjusting for this tokenizer."
+        )
         role_embed = embed_ids(role_ids.to(device))
+
         talker_input_embed = torch.cat(
             (tts_pad_embed.expand(-1, codec_input_embedding.shape[1] - 2, -1), tts_bos_embed),
             dim=1,
         ) + codec_input_embedding[:, :-1]
         talker_input_embed = torch.cat((role_embed, talker_input_embed), dim=1)
-        
+
         # First committed talker token fills the one real content-token slot
-        # (mirrors modeling_qwen3_tts.py:2472); any further tokens from the same
-        # first chunk become the start of trailing_text_hidden below.
+        # (mirrors _build_talker_inputs's `input_id[:, 3:4]` handling above);
+        # any further tokens from the same first chunk become the start of
+        # trailing_text_hidden below.
         first_token_embed = first_chunk_embed[:, :1] + codec_input_embedding[:, -1:]
         talker_input_embed = torch.cat([talker_input_embed, first_token_embed], dim=1)
-        
+
         if instruct_ids is not None:
             instruct_embed = embed_ids(instruct_ids.to(device))
             talker_input_embed = torch.cat([instruct_embed, talker_input_embed], dim=1)
-        
+
         talker_attention_mask = torch.ones(talker_input_embed.shape[:2], device=device, dtype=torch.long)
-        
+
         trailing_text_hidden = first_chunk_embed[:, 1:]
         eos_appended = False
         # NOTE: if text_source already reported finished=True during priming
         # (e.g. it was a single short chunk with an immediate close()), that
-        # does not need handling here -- the main loop below polls text_source
+        # doesn't need handling here -- the main loop below polls text_source
         # again on its first iteration, sees finished=True itself, and appends
-        # tts_eos_embed there. Do not try to special-case it here too.
-        
+        # tts_eos_embed there. Don't try to special-case it here too.
+
         # --- EOS ids / suppress tokens (mirrors stream_generate_pcm) ---
         eos_ids = {
             self.config.talker_config.codec_eos_token_id,
@@ -3129,7 +3223,36 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         }
         vocab_size = self.config.talker_config.vocab_size
         suppress_tokens = [i for i in range(vocab_size - 1024, vocab_size) if i not in eos_ids]
-        
+        # eos_ids mixes codec-vocabulary ids (codec_eos_token_id, 2150, 2157 --
+        # values a sampled codec token can actually take, bounded by
+        # vocab_size) with LLM-text-vocabulary ids (151670, tts_eos_token_id,
+        # im_end_token_id, 151643 -- values codec_ids can never actually be,
+        # since it's sampled from a vocab_size-sized distribution). The
+        # `codec_ids[0, 0].item() in eos_ids` check below tolerates the
+        # out-of-range ones harmlessly (a Python set lookup just returns
+        # False), but using the same full set as tensor indices for
+        # suppression does not -- only the in-range subset is a valid index.
+        codec_space_eos_ids = [i for i in eos_ids if i < vocab_size]
+
+        def pick_next_token(logits, allow_eos):
+            # The model can spontaneously choose to emit an EOS-designated
+            # codec token well before the text is actually done -- confirmed
+            # by direct trace: rising EOS probability during extended
+            # pad-fallback stretches, with no injected tts_eos_embed anywhere
+            # near yet. Since nothing about the KV-cache/generation loop
+            # requires stopping just because that token value got sampled,
+            # simply don't let it be chosen until text_source has genuinely
+            # reported finished (mirrors how suppress_tokens already masks
+            # a different range of special tokens the same way). Once
+            # allow_eos is True, this is a no-op -- identical to the existing
+            # legitimate-ending behavior.
+            current_suppress = suppress_tokens if allow_eos else suppress_tokens + codec_space_eos_ids
+            if do_sample:
+                return _sample_next_token(logits, temperature, top_k, top_p, current_suppress)
+            masked = logits.clone()
+            masked[..., current_suppress] = float("-inf")
+            return torch.argmax(masked, dim=-1)
+
         torch.compiler.cudagraph_mark_step_begin()
         out = self.talker.forward(
             inputs_embeds=talker_input_embed,
@@ -3151,47 +3274,93 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         past_key_values = out.past_key_values
         past_hidden = out.past_hidden
         generation_step = out.generation_step
-        
+
         last_logits = out.logits[:, -1, :]
-        if do_sample:
-            token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
-        else:
-            token = torch.argmax(last_logits, dim=-1)
-        
+        # Don't allow EOS just because finished=True -- there can still be a
+        # backlog of already-committed real content sitting in
+        # trailing_text_hidden that generation_step hasn't reached yet (e.g.
+        # several words committed in the same poll(), right before close()).
+        # Only allow it once there's truly nothing left to consume.
+        token = pick_next_token(last_logits, allow_eos=finished and generation_step >= trailing_text_hidden.shape[1])
+
         codes_buffer: list = []
-        decoded_tail = None
+        decoded_tail: Optional[np.ndarray] = None
         frames_since_emit = 0
         total_frames_emitted = 0
-        
+        ended_via_eos = False
+        frames_since_finished = 0
+
         for step_idx in range(max_frames):
             torch.compiler.cudagraph_mark_step_begin()
-        
+
             g = generation_step
             new_chunks, finished = text_source.poll()
-            new_rows = None
-            if new_chunks:
-                new_rows = self._embed_text_chunk(" ".join(new_chunks) + " ", tokenize_fn)
-            if finished and not eos_appended:
-                new_rows = tts_eos_embed if new_rows is None else torch.cat([new_rows, tts_eos_embed], dim=1)
-                eos_appended = True
-        
+            new_rows = self._embed_committed_words(new_chunks, tokenize_fn)
+
+            if finished:
+                if not eos_appended:
+                    new_rows = tts_eos_embed if new_rows is None else torch.cat([new_rows, tts_eos_embed], dim=1)
+                    eos_appended = True
+            else:
+                # finished can flip back to False if it was only an
+                # idle-timeout guess and text_source.push() revoked it (see
+                # LiveTextSource) -- reset so a later finish re-injects a
+                # fresh tts_eos_embed rather than treating it as already done.
+                eos_appended = False
+
+            # caught_up: is there any backlog of already-committed real
+            # content (including whatever just arrived this poll) that
+            # generation_step hasn't reached yet? Reused for two different
+            # decisions below -- pausing (not finished) and the wind-down
+            # counter (finished) both need this, not just raw `finished`,
+            # since e.g. several words can commit in the same poll() right
+            # before close() and still need to be spoken before winding down.
+            prospective_len = trailing_text_hidden.shape[1] + (new_rows.shape[1] if new_rows is not None else 0)
+            caught_up = prospective_len <= g
+
+            if finished and caught_up:
+                frames_since_finished += 1
+            else:
+                frames_since_finished = 0
+
+            if finished and frames_since_finished > wind_down_frames:
+                # The talker hasn't chosen to emit its own EOS within a
+                # bounded number of pad-conditioned steps after the text
+                # genuinely ended (and nothing is left queued) -- stop rather
+                # than let this run indefinitely (previously observed:
+                # highly variable, sometimes 100+ pad frames / tens of
+                # seconds for a single short utterance). finished=True here,
+                # so this is not the max_frames-exhaustion-with-pending-text
+                # failure case below.
+                ended_via_eos = True
+                break
+
+            # Pause (don't call forward() at all this tick) rather than pad
+            # through it, as long as text_source isn't genuinely finished
+            # yet. The talker has no notion of wall-clock time -- position
+            # only depends on how many forward() calls have been made, not
+            # when -- so blocking here and resuming once real text arrives
+            # is fully transparent to it: same KV-cache, same
+            # generation_step, no discontinuity. This is what actually
+            # avoids the OOD-padding risk (rising spontaneous-EOS
+            # probability, excessive babbling) rather than just reacting to
+            # it after the fact. Once finished=True, fall through to the
+            # existing pad/EOS-wind-down behavior unchanged -- that's the
+            # legitimate, trained-for use of padding at the genuine end of
+            # an utterance.
+            if not finished and caught_up:
+                text_source.wait_for_more()
+                continue
+
             # Realign before appending: trailing_text_hidden is read by absolute
-            # index (generation_step), not FIFO. If a prior step already fell
-            # back to pad, backfill explicit pad rows up to g first so new real
-            # rows land at the correct upcoming index instead of permanently
-            # behind where generation_step has already advanced to.
-            current_len = trailing_text_hidden.shape[1]
-            if current_len < g:
-                gap = g - current_len
-                trailing_text_hidden = torch.cat(
-                    [trailing_text_hidden, tts_pad_embed.expand(-1, gap, -1)], dim=1
-                )
-            if new_rows is not None and new_rows.shape[1] > 0:
-                trailing_text_hidden = torch.cat([trailing_text_hidden, new_rows], dim=1)
-        
+            # index (generation_step), not FIFO. See _realign_trailing_text_hidden.
+            trailing_text_hidden = _realign_trailing_text_hidden(
+                trailing_text_hidden, g, new_rows, tts_pad_embed
+            )
+
             if on_frame is not None:
                 on_frame(step_idx, g >= trailing_text_hidden.shape[1])
-        
+
             step_out = self.talker.forward(
                 input_ids=token.unsqueeze(1),
                 use_cache=True,
@@ -3207,88 +3376,107 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 subtalker_top_p=subtalker_top_p,
                 subtalker_temperature=subtalker_temperature,
             )
-        
+
             past_key_values = step_out.past_key_values
             past_hidden = step_out.past_hidden
             generation_step = step_out.generation_step
-        
+
             codec_ids = step_out.hidden_states[1]
 
-            # Guard against meta tensors (can occur with accelerate CPU offloading
-            # where offloaded parameters become meta placeholders that leak into outputs).
-            if codec_ids.is_meta:
-                print("[TTS] Warning: meta tensor in codec_ids; ending generation.")
-                break
-
             if codec_ids[0, 0].item() in eos_ids:
+                ended_via_eos = True
                 break
 
             codes_buffer.append(codec_ids[0].detach())
-        
+
             step_logits = step_out.logits[:, -1, :]
-            if do_sample:
-                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
-            else:
-                token = torch.argmax(step_logits, dim=-1)
-        
+            # Same reasoning as the post-priming call above: don't allow EOS
+            # while there's still committed real content queued up ahead of
+            # generation_step that hasn't been consumed/spoken yet.
+            token = pick_next_token(
+                step_logits, allow_eos=finished and generation_step >= trailing_text_hidden.shape[1]
+            )
+
             frames_since_emit += 1
             if frames_since_emit < emit_every_frames:
                 continue
             frames_since_emit = 0
-        
+
             start_idx = max(0, len(codes_buffer) - decode_window_frames)
             window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
-        
+
             if use_optimized_decode and hasattr(self.speech_tokenizer, "decode_streaming"):
                 wavs, sr = self.speech_tokenizer.decode_streaming(
                     window_codes.to(device), use_optimized=True, pad_to_size=decode_window_frames,
                 )
             else:
                 wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window_codes.to(device)}])
-        
+
             wav = wavs[0].astype(np.float32)
             samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
             step_samples = samples_per_frame * emit_every_frames
             chunk = wav[-step_samples:] if step_samples > 0 else wav
-        
+
             if decoded_tail is not None and overlap_samples > 0:
                 ov = min(overlap_samples, len(decoded_tail), len(chunk))
                 if ov > 0:
                     head = _crossfade(decoded_tail[-ov:], chunk[:ov])
                     chunk = np.concatenate([head, chunk[ov:]], axis=0)
-        
+
             decoded_tail = chunk.copy()
             total_frames_emitted = len(codes_buffer)
             yield chunk, sr
-        
+
         remaining_frames = len(codes_buffer) - total_frames_emitted
         if remaining_frames > 0:
             context_frames = min(total_frames_emitted, decode_window_frames - remaining_frames)
             start_idx = total_frames_emitted - context_frames
             window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
-        
+
             wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window_codes.to(device)}])
             wav = wavs[0].astype(np.float32)
-        
+
             if context_frames > 0:
                 samples_per_frame = len(wav) / window_codes.shape[0]
                 skip_samples = int(context_frames * samples_per_frame)
                 wav = wav[skip_samples:]
-        
+
             if decoded_tail is not None and overlap_samples > 0 and len(wav) > 0:
                 ov = min(overlap_samples, len(decoded_tail), len(wav))
                 if ov > 0:
                     head = _crossfade(decoded_tail[-ov:], wav[:ov])
                     wav = np.concatenate([head, wav[ov:]], axis=0)
-        
+
             blend_samples = overlap_samples
             if blend_samples > 0 and len(wav) > blend_samples:
                 fade_len = min(blend_samples, len(wav))
                 t = np.arange(fade_len, dtype=np.float32) / max(fade_len - 1, 1)
                 fade_out = 0.5 * (1 + np.cos(np.pi * t))
                 wav[-fade_len:] *= fade_out
-        
+
             yield wav, sr
+
+        if not ended_via_eos and not finished:
+            # Loop exhausted max_frames without the talker ever choosing to
+            # stop and without text_source reporting finished -- generation
+            # was cut off with more text still expected, not because the
+            # utterance was actually complete. Whatever was already
+            # generated has already been yielded above (nothing is lost),
+            # but the caller needs an explicit signal that this happened
+            # rather than silently treating a truncated utterance as a
+            # normal, complete one. Mirrors the existing TimeoutError raised
+            # elsewhere in this method for a different "couldn't complete
+            # as requested" case (no text ever arrived).
+            raise RuntimeError(
+                f"stream_generate_pcm_live_text exhausted max_frames={max_frames} "
+                "while text_source had not reported finished -- generation was "
+                "cut off mid-utterance with more text still expected. Already-"
+                "generated audio was yielded normally before this was raised. "
+                "Increase max_frames, or investigate why text_source didn't "
+                "finish in time (a producer that never calls close() and "
+                "trickles text slower than max_frames worth of codec frames "
+                "will hit this)."
+            )
 
 
 __all__ = [

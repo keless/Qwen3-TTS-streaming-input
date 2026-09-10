@@ -9,6 +9,7 @@ import numpy as np
 import sounddevice as sd
 import torch
 from fastapi import FastAPI, HTTPException
+from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 
 from qwen_tts import Qwen3TTSModel
@@ -24,9 +25,24 @@ INSTRUCT = "Natural conversational speech."
 
 print("Loading Qwen3-TTS...")
 
+# Resolve to the local cache snapshot when available so `from_pretrained` never
+# needs a network round-trip (transformers' mistral-regex patch check hits the
+# HF API for non-local paths, which fails hard behind a blocking proxy).
+try:
+    model_path = snapshot_download(MODEL_NAME, local_files_only=True)
+except Exception:
+    model_path = MODEL_NAME
+
+if torch.backends.mps.is_available():
+    device_map = "mps"
+elif torch.cuda.is_available():
+    device_map = "auto"
+else:
+    device_map = "cpu"
+
 model = Qwen3TTSModel.from_pretrained(
-    MODEL_NAME,
-    device_map="auto",
+    model_path,
+    device_map=device_map,
     dtype=torch.bfloat16,
     attn_implementation="eager",
 )
@@ -71,6 +87,7 @@ class SessionState:
     thread: Optional[threading.Thread] = None
     sr: Optional[int] = None
     total_samples: int = 0
+    total_text_length: int = 0
     real_count: int = 0
     pad_count: int = 0
     error: Optional[BaseException] = None
@@ -319,15 +336,17 @@ async def append_text(request: TextRequest):
         raise HTTPException(status_code=400, detail="No active session. Call /speak_live first.")
 
     with _active_session._lock:
-        if _active_session.source.is_done():
+        if _active_session.source.is_closed():
             raise HTTPException(
                 status_code=409,
                 detail="Session already ended. Call /speak_live for a new session.",
             )
-        _active_session.source.append(request.text)
+        _active_session.source.push(request.text)
+        _active_session.total_text_length += len(request.text)
+        total_length = _active_session.total_text_length
 
     print(f"[TTS/live] +text: {request.text!r}")
-    return {"status": "ok", "total_length": _active_session.source.get_total_length()}
+    return {"status": "ok", "total_length": total_length}
 
 
 @app.post("/chunks")
@@ -343,16 +362,18 @@ async def append_chunks(request: ChunksRequest):
         raise HTTPException(status_code=400, detail="No active session. Call /speak_live first.")
 
     with _active_session._lock:
-        if _active_session.source.is_done():
+        if _active_session.source.is_closed():
             raise HTTPException(
                 status_code=409,
                 detail="Session already ended. Call /speak_live for a new session.",
             )
         for chunk in request.chunks:
-            _active_session.source.append(chunk)
+            _active_session.source.push(chunk)
+            _active_session.total_text_length += len(chunk)
+        total_length = _active_session.total_text_length
 
     print(f"[TTS/live] +chunks: {len(request.chunks)} chunk(s)")
-    return {"status": "ok", "total_length": _active_session.source.get_total_length()}
+    return {"status": "ok", "total_length": total_length}
 
 
 @app.post("/end_stream")
@@ -376,7 +397,7 @@ async def end_stream():
 
     # Signal that no more text is coming.
     print("[TTS/live] End of text signaled.")
-    state.source.done()
+    state.source.close()
 
     # Wait for generation to finish (it will drain remaining text).
     state.generation_done.wait()
@@ -440,10 +461,10 @@ async def session_status():
         s = _active_session
     return {
         "status": "active",
-        "source_done": s.source.is_done(),
+        "source_done": s.source.is_closed(),
         "generation_done": s.generation_done.is_set(),
         "playback_done": s.playback_done.is_set(),
-        "total_length": s.source.get_total_length(),
+        "total_length": s.total_text_length,
         "total_samples": s.total_samples,
         "real_frames": s.real_count,
         "pad_frames": s.pad_count,

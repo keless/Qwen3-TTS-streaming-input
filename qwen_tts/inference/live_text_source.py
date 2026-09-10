@@ -13,171 +13,123 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Live text source for incremental text input during streaming TTS generation.
-
-This module provides a thread-safe text buffer that allows text to be appended
-incrementally while a consumer reads chunks as they become available. It is
-designed for real-time scenarios where text arrives from a streaming source
-(e.g., an LLM response, WebSocket, or user input) and needs to be fed to the
-TTS generator without waiting for the full text to be available.
-
-Example usage::
-
-    from qwen_tts.inference.live_text_source import LiveTextSource
-
-    source = LiveTextSource()
-
-    # Producer thread: appends text as it arrives
-    def producer():
-        source.append("Hello, ")
-        source.append("world!")
-        source.done()
-
-    # Consumer: reads chunks as they become available
-    while not source.is_done():
-        chunk = source.get_next_chunk(timeout=1.0)
-        if chunk is None:
-            break
-        print(f"Got chunk: {chunk}")
 """
+Thread-safe, granularity-agnostic text ingestion buffer for streaming
+generation. Producers call push()/close() with text fragments of any size
+(LLM token deltas, whole words, whole sentences); consumers call poll() once
+per generation step to drain newly boundary-safe-committed text, or
+wait_for_more() to block until there's something new instead of polling in
+a sleep loop.
 
+"Finished" (poll()'s second return value) has two different sources with
+different permanence:
+  - Explicit close() -- the producer confirmed there's no more text. Permanent.
+  - Idle timeout -- we *guessed* the producer is done because nothing arrived
+    for idle_timeout_s. This is only a guess and can be wrong (a slow LLM, a
+    thinking pause), so it's revocable: a push() after an idle-timeout-based
+    finish is accepted normally (not dropped) and un-finishes the source,
+    since fresh input is direct evidence the guess was wrong. A push() after
+    an explicit close() is always dropped -- close() is a confirmed fact, not
+    a guess, and doesn't get revoked.
+
+This falls out for free from computing "is finished" fresh on every call
+rather than caching it: `_closed` is the only permanent bit; the idle check
+is always relative to `_last_arrival`, which push() naturally refreshes.
+
+See docs/superpowers/specs/2026-08-31-streaming-text-input-design.md.
+"""
 import threading
-from collections import deque
-from typing import Optional
+import time
+from typing import List, Optional, Tuple
 
 
 class LiveTextSource:
-    """Thread-safe text buffer for incremental text input during streaming.
+    def __init__(self, idle_timeout_s: float = 10.0):
+        self._idle_timeout_s = idle_timeout_s
+        self._cv = threading.Condition()
+        self._buffer = ""
+        self._closed = False
+        self._last_arrival = time.monotonic()
 
-    This class provides a producer-consumer interface for text that arrives
-    incrementally. Producers append text via ``append()``, and consumers read
-    chunks via ``get_next_chunk()`` which blocks until text is available
-    or the source is marked as done.
+    def push(self, fragment: str) -> None:
+        with self._cv:
+            if self._closed:
+                return
+            self._buffer += fragment
+            self._last_arrival = time.monotonic()
+            self._cv.notify_all()
 
-    The internal buffer uses a deque for O(1) appends and pops. A condition
-    variable coordinates blocking between producers and consumers.
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
 
-    Attributes:
-        total_length: Total number of characters appended so far (read-only).
-    """
-
-    def __init__(self) -> None:
-        self._buffer: deque[str] = deque()
-        self._done = False
-        self._total_length: int = 0
-        self._lock = threading.Lock()
-        self._not_empty = threading.Condition(self._lock)
-
-    def append(self, text: str) -> None:
-        """Append a text chunk to the buffer.
-
-        This method is thread-safe and can be called from any thread.
-        If the source is already marked as done, the text is silently
-        discarded.
-
-        Args:
-            text: The text chunk to append. Empty strings are ignored.
+    def is_closed(self) -> bool:
+        """Whether close() has been called (explicit end-of-input, not an
+        idle-timeout guess). Useful for callers that need a synchronous
+        "has the producer confirmed it's done" check outside the
+        poll()/wait_for_more() generation-loop protocol -- e.g. an HTTP
+        server rejecting further writes to an already-ended session.
         """
-        if not text:
-            return
+        with self._cv:
+            return self._closed
 
-        with self._not_empty:
-            self._buffer.append(text)
-            self._total_length += len(text)
-            self._not_empty.notify_all()
+    def poll(self) -> Tuple[List[str], bool]:
+        with self._cv:
+            return self._poll_locked()
 
-    def done(self) -> None:
-        """Mark the source as done.
+    def wait_for_more(self, timeout: Optional[float] = None) -> None:
+        """Block until poll() would return something new (a boundary-safe
+        commit, or finished), or `timeout` seconds elapse, whichever comes
+        first. Returns immediately if something is already available.
+        Does not itself consume/return anything -- call poll() after this
+        returns.
 
-        After calling this method, ``get_next_chunk()`` will return ``None``
-        once the buffer is empty. Further calls to ``append()`` are
-        silently discarded.
-
-        This wakes up any thread currently blocked in ``get_next_chunk()``.
+        The idle-timeout can't be woken by notify() (nothing happens, so
+        nothing calls it) -- the one bounded wait below is sized to the
+        exact remaining idle budget, not an arbitrary poll interval, so
+        this still wakes up immediately on push()/close() and otherwise
+        wakes up at precisely the moment the idle-timeout would fire.
         """
-        with self._not_empty:
-            self._done = True
-            self._not_empty.notify_all()
+        with self._cv:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while not self._has_pending_output_locked():
+                wait_s = self._idle_timeout_s - (time.monotonic() - self._last_arrival)
+                wait_s = max(0.0, wait_s)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    wait_s = min(wait_s, remaining)
+                self._cv.wait(timeout=wait_s)
 
-    def get_next_chunk(self, timeout: Optional[float] = None) -> Optional[str]:
-        """Block until a text chunk is available, then return it.
+    def _is_finished_locked(self) -> bool:
+        if self._closed:
+            return True
+        return (time.monotonic() - self._last_arrival) >= self._idle_timeout_s
 
-        This method blocks the calling thread until either:
-        - At least one text chunk is available in the buffer (returns the
-          oldest chunk).
-        - The source is marked as done and the buffer is empty (returns
-          ``None``).
-        - The optional timeout expires (returns ``None``).
+    def _has_pending_output_locked(self) -> bool:
+        if self._is_finished_locked():
+            return True
+        return self._last_whitespace_end(self._buffer) != -1
 
-        Args:
-            timeout: Maximum seconds to wait. ``None`` means wait
-                indefinitely.
+    def _poll_locked(self) -> Tuple[List[str], bool]:
+        if self._is_finished_locked():
+            committed = self._buffer.split()
+            self._buffer = ""
+            return committed, True
 
-        Returns:
-            The next text chunk as a string, or ``None`` if the source is
-            done (or timed out) with nothing available.
-        """
-        with self._not_empty:
-            while len(self._buffer) == 0:
-                if self._done:
-                    return None
-                if not self._not_empty.wait(timeout=timeout):
-                    # Timeout expired
-                    if len(self._buffer) == 0:
-                        return None
-                    # New data arrived during wait, fall through
-            chunk = self._buffer.popleft()
-            return chunk
+        boundary = self._last_whitespace_end(self._buffer)
+        if boundary == -1:
+            return [], False
 
-    def is_done(self) -> bool:
-        """Check whether the source has been marked as done.
+        safe_part, remaining = self._buffer[:boundary], self._buffer[boundary:]
+        self._buffer = remaining
+        return safe_part.split(), False
 
-        Returns:
-            ``True`` if ``done()`` has been called, ``False`` otherwise.
-        """
-        with self._lock:
-            return self._done
-
-    def peek(self) -> str:
-        """Return the next available text chunk without removing it.
-
-        If the buffer is empty, returns an empty string.
-
-        Returns:
-            The next text chunk, or ``""`` if nothing is available.
-        """
-        with self._lock:
-            if self._buffer:
-                return self._buffer[0]
-            return ""
-
-    def get_total_length(self) -> int:
-        """Return the total number of characters appended so far.
-
-        This is a monotonic counter of all text passed to ``append()``
-        (excluding empty strings). It does not decrease when chunks are
-        consumed.
-
-        Returns:
-            Total character count.
-        """
-        with self._lock:
-            return self._total_length
-
-    def poll(self) -> tuple[list[str], bool]:
-        """Return all buffered chunks and done-status without blocking.
-
-        This method is non-blocking and returns immediately. It is designed
-        for the TTS generation loop which polls for new text on every
-        generation step.
-
-        Returns:
-            A tuple of (chunks, finished) where:
-            - chunks: list of text strings buffered since last poll (may be empty)
-            - finished: True if done() was called and buffer is now empty
-        """
-        with self._lock:
-            chunks = list(self._buffer)
-            self._buffer.clear()
-            finished = self._done and len(chunks) == 0
-            return chunks, finished
+    @staticmethod
+    def _last_whitespace_end(text: str) -> int:
+        for i in range(len(text) - 1, -1, -1):
+            if text[i].isspace():
+                return i + 1
+        return -1
