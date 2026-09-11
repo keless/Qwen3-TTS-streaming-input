@@ -896,6 +896,15 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         while start_index < codes.shape[-1]:
             end_index = min(start_index + chunk_size, codes.shape[-1])
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
+            # Guard: context_size is capped at start_index to prevent
+            # negative start index, which would wrap around in PyTorch
+            # instead of zero-padding. This ensures correct behavior at
+            # the start of the tensor where there is no prior context.
+            assert start_index - context_size >= 0, (
+                f"Negative start index {start_index - context_size} in chunked_decode: "
+                f"start_index={start_index}, context_size={context_size}, "
+                f"left_context_size={left_context_size}"
+            )
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self(codes_chunk)
             wavs.append(wav_chunk[..., context_size * self.total_upsample :])
