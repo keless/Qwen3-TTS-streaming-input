@@ -3019,20 +3019,25 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_top_p: float = 1.0,
         subtalker_temperature: float = 0.9,
         # Streaming control
-        # NOTE: two-phase settings (first_chunk_emit_every/decode_window/frames)
-        # from stream_generate_pcm are intentionally omitted here -- the harness
-        # in Task 4 doesn't need them (its baseline doesn't enable them either),
-        # and adding them is straightforward later by copying the same phase-1/
-        # phase-2 branch from stream_generate_pcm if this graduates past a PoC.
         emit_every_frames: int = 8,
         decode_window_frames: int = 80,
         overlap_samples: int = 0,
         max_frames: int = 10000,
         use_optimized_decode: bool = False,
+        # Two-phase first-chunk settings, ported from stream_generate_pcm (see
+        # its docstring) -- without these the very first decode window is
+        # built from only a handful of real codec frames padded out to the
+        # full decode_window_frames, an out-of-distribution input for the
+        # vocoder that audibly distorts the first chunk. 0 = disabled (old
+        # behavior); non-zero matches stream_generate_pcm's defaults.
+        first_chunk_emit_every: int = 0,
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,
         # Live-text control
         priming_timeout_s: float = 10.0,
         on_frame: Optional[Callable[[int, bool], None]] = None,
         wind_down_frames: int = 200,
+        wind_down_multiplier: float = 6.0,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation while consuming text incrementally from
@@ -3047,21 +3052,39 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             speaker: Speaker name, validated by the caller.
             language: Language name, validated by the caller.
             instruct_ids: Optional pre-tokenized instruction ids.
+            first_chunk_emit_every/first_chunk_decode_window/first_chunk_frames:
+                Two-phase first-chunk settings, same meaning as in
+                stream_generate_pcm. 0 for first_chunk_emit_every disables
+                this (old behavior: decode_window_frames/emit_every_frames
+                used from the first frame -- decoding a near-empty window
+                that small is out-of-distribution for the vocoder and
+                audibly distorts the first chunk).
             priming_timeout_s: Max time to wait for the first text to arrive
                 before raising TimeoutError.
             on_frame: Optional callback(step_idx, used_pad) invoked once per
                 decode step, for telemetry (pad-fallback vs. real-text frames).
-            wind_down_frames: Once text_source reports finished, the talker
-                is still allowed to keep going on padding until it chooses to
-                emit its own EOS (the legitimate, trained-for behavior at the
-                genuine end of an utterance) -- but that can occasionally take
-                a highly variable, sometimes very large number of frames.
-                Force a stop after this many pad-conditioned frames past the
-                point finished became true, instead of waiting indefinitely.
-                If text_source's finish was only an idle-timeout guess and
-                gets revoked by a later push() before this triggers, the
-                counter resets to 0 and a fresh window starts if/when it
-                finishes again.
+            wind_down_frames: Floor for the wind-down cap below (see
+                wind_down_multiplier) -- the value actually used for short
+                utterances, where real_frames_generated is too small for the
+                multiplier term to matter. Once text_source reports finished,
+                the talker is still allowed to keep going on padding until it
+                chooses to emit its own EOS (the legitimate, trained-for
+                behavior at the genuine end of an utterance) -- but that can
+                occasionally take a highly variable, sometimes very large
+                number of frames. Force a stop after this many pad-conditioned
+                frames past the point finished became true, instead of
+                waiting indefinitely. If text_source's finish was only an
+                idle-timeout guess and gets revoked by a later push() before
+                this triggers, the counter resets to 0 and a fresh window
+                starts if/when it finishes again.
+            wind_down_multiplier: The actual cap is
+                max(wind_down_frames, wind_down_multiplier * real_frames_generated)
+                -- measured empirically at ~3.9x real_frames_generated across
+                utterances from 103 to 309 words (the ratio held constant per
+                word, not per call), so a multiplier alone (no fixed
+                per-utterance constant) scales correctly with utterance
+                length. Without this, longer utterances get their tail
+                truncated well before the talker reaches its own EOS.
 
         Yields:
             Tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -3088,12 +3111,32 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         while True:
             chunks, finished = text_source.poll()
             primed_chunks.extend(chunks)
-            if primed_chunks or finished:
+            if primed_chunks:
                 break
+            if finished and text_source.is_closed():
+                break
+
             remaining = priming_timeout_s - (time.monotonic() - start)
             if remaining <= 0:
                 raise TimeoutError("No text arrived within priming_timeout_s; nothing to generate.")
-            text_source.wait_for_more(timeout=remaining)
+
+            if finished:
+                # `finished` here is only text_source's idle-timeout *guess*
+                # that the producer is done (see LiveTextSource docstring) --
+                # revocable by a later push(), not a confirmed close(). The
+                # main generation loop below already honors that revocability;
+                # this priming loop previously didn't, so a slow-starting
+                # producer (e.g. an LLM that takes a few seconds to produce
+                # its first token) would have generation killed outright the
+                # instant the idle guess fired, even though priming_timeout_s
+                # budget remained and text does show up moments later.
+                # wait_for_more() would return instantly here (it already
+                # treats "finished" as pending output), so poll on a short
+                # bounded tick instead, until real content, close(), or the
+                # actual priming_timeout_s deadline decides this.
+                time.sleep(min(remaining, 0.1))
+            else:
+                text_source.wait_for_more(timeout=remaining)
 
         if not primed_chunks:
             raise TimeoutError("Text source finished with no text; nothing to generate.")
@@ -3289,6 +3332,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         total_frames_emitted = 0
         ended_via_eos = False
         frames_since_finished = 0
+        real_frames_generated = 0
 
         for step_idx in range(max_frames):
             torch.compiler.cudagraph_mark_step_begin()
@@ -3308,22 +3352,55 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 # fresh tts_eos_embed rather than treating it as already done.
                 eos_appended = False
 
+            # Merge immediately, before any pause/wind-down decision below.
+            # new_rows was just poll()'d -- and therefore already removed
+            # from text_source -- so if a branch below skips straight to
+            # `continue` without persisting it here first, it would be
+            # discarded permanently (text_source no longer has it either).
+            # This exact case happens whenever a mid-stream idle-timeout
+            # guess (finished=True) starts the wind-down pad phase --
+            # generation_step (g) keeps advancing via padding while this
+            # tensor's length stalls -- and is then revoked by a later
+            # push(): g has raced ahead of trailing_text_hidden's length by
+            # the time finished flips back to False, so the newly-arrived
+            # real words must land at that future index (which
+            # _realign_trailing_text_hidden's backfill-then-append already
+            # handles), not be dropped by an early `continue` before ever
+            # reaching this call.
+            trailing_text_hidden = _realign_trailing_text_hidden(
+                trailing_text_hidden, g, new_rows, tts_pad_embed
+            )
+
             # caught_up: is there any backlog of already-committed real
-            # content (including whatever just arrived this poll) that
-            # generation_step hasn't reached yet? Reused for two different
-            # decisions below -- pausing (not finished) and the wind-down
-            # counter (finished) both need this, not just raw `finished`,
-            # since e.g. several words can commit in the same poll() right
-            # before close() and still need to be spoken before winding down.
-            prospective_len = trailing_text_hidden.shape[1] + (new_rows.shape[1] if new_rows is not None else 0)
-            caught_up = prospective_len <= g
+            # content (already merged above) that generation_step hasn't
+            # reached yet? Reused for two different decisions below --
+            # pausing (not finished) and the wind-down counter (finished)
+            # both need this, not just raw `finished`, since e.g. several
+            # words can commit in the same poll() right before close() and
+            # still need to be spoken before winding down.
+            caught_up = trailing_text_hidden.shape[1] <= g
 
             if finished and caught_up:
                 frames_since_finished += 1
             else:
                 frames_since_finished = 0
+            if not caught_up:
+                real_frames_generated += 1
 
-            if finished and frames_since_finished > wind_down_frames:
+            # A fixed wind_down_frames badly under-shoots longer utterances:
+            # the pad-conditioned wind-down phase (the talker finishing the
+            # tail of already-committed real content from its own KV-cache/
+            # hidden state, not new conditioning) scales with how much real
+            # content was actually generated, not a per-utterance constant --
+            # measured ~3.9x real_frames_generated across texts from 103 to
+            # 309 words (ratio held constant, i.e. per-word, not per-call).
+            # wind_down_frames remains the floor for short utterances (where
+            # it was already sufficient); wind_down_multiplier's margin over
+            # the measured ratio covers longer ones without truncating them.
+            effective_wind_down_frames = max(
+                wind_down_frames, int(wind_down_multiplier * real_frames_generated)
+            )
+            if finished and frames_since_finished > effective_wind_down_frames:
                 # The talker hasn't chosen to emit its own EOS within a
                 # bounded number of pad-conditioned steps after the text
                 # genuinely ended (and nothing is left queued) -- stop rather
@@ -3351,12 +3428,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             if not finished and caught_up:
                 text_source.wait_for_more()
                 continue
-
-            # Realign before appending: trailing_text_hidden is read by absolute
-            # index (generation_step), not FIFO. See _realign_trailing_text_hidden.
-            trailing_text_hidden = _realign_trailing_text_hidden(
-                trailing_text_hidden, g, new_rows, tts_pad_embed
-            )
 
             if on_frame is not None:
                 on_frame(step_idx, g >= trailing_text_hidden.shape[1])
@@ -3398,14 +3469,29 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             )
 
             frames_since_emit += 1
-            if frames_since_emit < emit_every_frames:
+
+            # Two-phase streaming: same rationale as stream_generate_pcm --
+            # aggressive (small, fast) settings while codes_buffer is still
+            # short, stable settings once there's enough real history for a
+            # full decode_window_frames window.
+            total_frames_generated = len(codes_buffer)
+            if first_chunk_emit_every > 0 and total_frames_generated < first_chunk_frames:
+                current_emit_every = first_chunk_emit_every
+                current_decode_window = first_chunk_decode_window
+                current_use_optimized = False  # Non-optimized allows flexible window size
+            else:
+                current_emit_every = emit_every_frames
+                current_decode_window = decode_window_frames
+                current_use_optimized = use_optimized_decode
+
+            if frames_since_emit < current_emit_every:
                 continue
             frames_since_emit = 0
 
-            start_idx = max(0, len(codes_buffer) - decode_window_frames)
+            start_idx = max(0, len(codes_buffer) - current_decode_window)
             window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
 
-            if use_optimized_decode and hasattr(self.speech_tokenizer, "decode_streaming"):
+            if current_use_optimized and hasattr(self.speech_tokenizer, "decode_streaming"):
                 wavs, sr = self.speech_tokenizer.decode_streaming(
                     window_codes.to(device), use_optimized=True, pad_to_size=decode_window_frames,
                 )
@@ -3414,7 +3500,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             wav = wavs[0].astype(np.float32)
             samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
-            step_samples = samples_per_frame * emit_every_frames
+            step_samples = samples_per_frame * current_emit_every
             chunk = wav[-step_samples:] if step_samples > 0 else wav
 
             if decoded_tail is not None and overlap_samples > 0:

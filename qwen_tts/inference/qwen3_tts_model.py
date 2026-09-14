@@ -1150,6 +1150,10 @@ class Qwen3TTSModel:
         max_frames: int = 10000,
         use_optimized_decode: bool = False,
         wind_down_frames: int = 200,
+        wind_down_multiplier: float = 6.0,
+        first_chunk_emit_every: int = 0,
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1175,11 +1179,16 @@ class Qwen3TTSModel:
                 yielding whatever was already generated -- see its docstring.
             use_optimized_decode: Use CUDA graph optimized decode when
                 available (requires enable_streaming_optimizations()).
-            wind_down_frames: Once text_source reports finished, force a stop
-                after this many pad-conditioned frames if the talker hasn't
-                chosen to emit its own EOS by then -- see
-                stream_generate_pcm_live_text's docstring for why this is
-                bounded rather than unconditional.
+            wind_down_frames: Floor for the wind-down cap (see
+                wind_down_multiplier) -- see stream_generate_pcm_live_text's
+                docstring for why this is bounded rather than unconditional.
+            wind_down_multiplier: The actual cap scales with utterance length
+                -- see stream_generate_pcm_live_text's docstring.
+            first_chunk_emit_every/first_chunk_decode_window/first_chunk_frames:
+                Two-phase first-chunk settings (see stream_generate_custom_voice's
+                same-named params). 0 for first_chunk_emit_every disables this;
+                without it the first chunk is decoded from a near-empty window
+                padded out to decode_window_frames, which audibly distorts it.
             **kwargs: Sampling parameters only -- do_sample, top_k, top_p, temperature,
                 subtalker_dosample, subtalker_top_k, subtalker_top_p, subtalker_temperature.
 
@@ -1227,6 +1236,10 @@ class Qwen3TTSModel:
             max_frames=max_frames,
             use_optimized_decode=use_optimized_decode,
             wind_down_frames=wind_down_frames,
+            wind_down_multiplier=wind_down_multiplier,
+            first_chunk_emit_every=first_chunk_emit_every,
+            first_chunk_decode_window=first_chunk_decode_window,
+            first_chunk_frames=first_chunk_frames,
             **gen_kwargs,
         ):
             yield chunk, sr

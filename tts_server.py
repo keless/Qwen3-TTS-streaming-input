@@ -22,6 +22,15 @@ SPEAKER = "Sohee"
 LANGUAGE = "English"
 INSTRUCT = "Natural conversational speech."
 
+# How long to wait for the *first* text after /speak_live before giving up on
+# the session entirely (e.g. an LLM producer that takes a while to produce
+# its first token). Deliberately much larger than LiveTextSource's own
+# default idle_timeout_s=10.0 (which governs mid-utterance "producer seems
+# done" pause detection, a different concern) -- see the priming-loop fix in
+# stream_generate_pcm_live_text that makes this budget actually usable rather
+# than being cut short by that shorter idle guess.
+PRIMING_TIMEOUT_S = 60.0
+
 
 print("Loading Qwen3-TTS...")
 
@@ -47,11 +56,13 @@ model = Qwen3TTSModel.from_pretrained(
     attn_implementation="eager",
 )
 
+# Make sure this is on if you're in MacOS, or you'll get slow/choppy output; 
+# wouldnt hurt on CUDA either.
+model.model.talker.enable_fast_codebook_gen(True)
+
 print("Qwen3-TTS ready.")
 
-
 app = FastAPI()
-
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -103,24 +114,65 @@ _session_lock = asyncio.Lock()  # protects _active_session creation
 # Playback thread (runs per-session)
 # ---------------------------------------------------------------------------
 
+# Generation on hardware that sits close to real-time and starting playback on 
+# the very first chunk leaves zero margin -- any momentary generation slowdown 
+# immediately underruns the output device, heard as a click/gap. Buffering a 
+# short cushion first absorbs that jitter instead.
+PREBUFFER_SECONDS = 0.4
+
+# Opening a new OutputStream on the default device shortly after a previous
+# one closed can transiently fail on macOS CoreAudio (PaMacCore/AUHAL) with
+# "Invalid Property Value" ([-9986]) while the OS finishes tearing down the
+# old one -- observed in practice between back-to-back live-text sessions. 
+# So retry after a short delay or it will fail to open.
+STREAM_OPEN_RETRIES = 3
+STREAM_OPEN_RETRY_DELAY_S = 0.2
+
+
+def _open_output_stream(samplerate: int) -> sd.OutputStream:
+    for attempt in range(1, STREAM_OPEN_RETRIES + 1):
+        try:
+            stream = sd.OutputStream(
+                samplerate=samplerate, channels=1, dtype="float32", blocksize=0,
+            )
+            stream.start()
+            return stream
+        except sd.PortAudioError as exc:
+            if attempt == STREAM_OPEN_RETRIES:
+                raise
+            print(
+                f"[TTS/live] OutputStream open failed (attempt {attempt}/"
+                f"{STREAM_OPEN_RETRIES}): {exc!r} -- retrying"
+            )
+            time.sleep(STREAM_OPEN_RETRY_DELAY_S)
+
+
 def _playback_worker(audio_queue: queue.Queue, done_event: threading.Event):
     """Drain audio chunks from the queue and play them via sounddevice."""
     stream = None
+    prebuffered: list = []
+    prebuffered_seconds = 0.0
+    last_sr = None
     try:
         while True:
             item = audio_queue.get()
             if item is None:
-                return
+                break
             chunk, chunk_sr = item
+            last_sr = chunk_sr
             if stream is None:
-                stream = sd.OutputStream(
-                    samplerate=chunk_sr,
-                    channels=1,
-                    dtype="float32",
-                    blocksize=0,
-                )
-                stream.start()
-            stream.write(chunk)
+                prebuffered.append(chunk)
+                prebuffered_seconds += len(chunk) / chunk_sr
+                if prebuffered_seconds < PREBUFFER_SECONDS:
+                    continue
+                stream = _open_output_stream(chunk_sr)
+                stream.write(np.concatenate(prebuffered))
+            else:
+                stream.write(chunk)
+        if stream is None and prebuffered:
+            # Whole utterance was shorter than PREBUFFER_SECONDS -- play what we have.
+            stream = _open_output_stream(last_sr)
+            stream.write(np.concatenate(prebuffered))
     finally:
         if stream is not None:
             stream.stop()
@@ -154,6 +206,11 @@ def _generation_worker(
                 language=LANGUAGE,
                 instruct=INSTRUCT,
                 on_frame=on_frame,
+                priming_timeout_s=PRIMING_TIMEOUT_S,
+                use_optimized_decode=True,
+                first_chunk_emit_every=8,
+                first_chunk_decode_window=48,
+                first_chunk_frames=48,
             )
         ):
             chunk = chunk.astype(np.float32, copy=False)
@@ -208,10 +265,7 @@ async def speak(request: SpeechRequest):
                     chunk, chunk_sr = item
                     sr = chunk_sr
                     print("[TTS] Starting audio playback")
-                    stream = sd.OutputStream(
-                        samplerate=sr, channels=1, dtype="float32", blocksize=0,
-                    )
-                    stream.start()
+                    stream = _open_output_stream(sr)
                     stream.write(chunk)
                     break
                 while True:
@@ -341,6 +395,15 @@ async def append_text(request: TextRequest):
                 status_code=409,
                 detail="Session already ended. Call /speak_live for a new session.",
             )
+        if _active_session.generation_done.is_set():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Generation already ended for this session "
+                    f"(error={_active_session.error!r}). Call /end_stream and "
+                    "start a new session with /speak_live."
+                ),
+            )
         _active_session.source.push(request.text)
         _active_session.total_text_length += len(request.text)
         total_length = _active_session.total_text_length
@@ -367,6 +430,15 @@ async def append_chunks(request: ChunksRequest):
                 status_code=409,
                 detail="Session already ended. Call /speak_live for a new session.",
             )
+        if _active_session.generation_done.is_set():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Generation already ended for this session "
+                    f"(error={_active_session.error!r}). Call /end_stream and "
+                    "start a new session with /speak_live."
+                ),
+            )
         for chunk in request.chunks:
             _active_session.source.push(chunk)
             _active_session.total_text_length += len(chunk)
@@ -382,8 +454,8 @@ async def end_stream():
     Signal end of text input and wait for generation + playback to finish.
 
     Marks the LiveTextSource as done, waits for the generation thread to
-    complete (including any text already pushed), drains remaining audio
-    chunks to the playback queue, then waits for playback to finish.
+    complete (including any text already pushed), then waits for playback
+    to finish.
 
     Returns session stats (sample rate, frame counts, total duration).
     """
@@ -393,33 +465,29 @@ async def end_stream():
         if _active_session is None:
             raise HTTPException(status_code=400, detail="No active session. Call /speak_live first.")
         state = _active_session
-        _active_session = None
+        # Not cleared here -- a new /speak_live must keep 409ing until this 
+        # session's playback thread has actually released the audio device below.
 
-    # Signal that no more text is coming.
     print("[TTS/live] End of text signaled.")
     state.source.close()
 
-    # Wait for generation to finish (it will drain remaining text).
-    state.generation_done.wait()
+    # Wait for generation to finish (it will drain remaining text). Offloaded
+    # via to_thread -- so we dont block which would make /health, etc., calls 
+    # time out while we're still ending.
+    await asyncio.to_thread(state.generation_done.wait)
     print("[TTS/live] Generation complete.")
 
-    # Drain any remaining audio chunks into the playback queue so they play out.
-    while True:
-        try:
-            item = state.audio_queue.get_nowait()
-            if item is not None:
-                state.audio_queue.put(item)  # re-queue for playback thread
-            else:
-                break
-        except queue.Empty:
-            break
-
-    # Send the playback sentinel.
     state.audio_queue.put(None)
 
-    # Wait for all queued audio to actually play.
-    state.playback_done.wait()
+    # Wait for all queued audio to actually play (see to_thread note above).
+    await asyncio.to_thread(state.playback_done.wait)
     print("[TTS/live] Playback complete.")
+
+    # Only now has this session fully released the audio device -- safe to
+    # let a new /speak_live claim _active_session.
+    async with _session_lock:
+        if _active_session is state:
+            _active_session = None
 
     with state._lock:
         sr = state.sr
